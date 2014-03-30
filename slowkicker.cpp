@@ -21,6 +21,7 @@
 // THE SOFTWARE.
 
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <cstring>
@@ -158,6 +159,36 @@ void log(const char* format,...)
     std::fclose(f);
 }
 
+std::string buildPath(const ONLINE& online)
+{
+    std::string realPath(GLFTPD_ROOT);
+    realPath += online.currentdir;
+
+    struct stat st;
+    if (stat(realPath.c_str(), &st) < 0) {
+        if (errno != ENOENT) {
+            log("Unable to stat path: %s: %s", online.currentdir, strerror(errno));
+        }
+        return "";
+    }
+
+    std::string path(online.currentdir);
+    if (S_ISDIR(st.st_mode)) {
+        const char* filename = online.status + 5;
+        if (filename == '\0') {
+            log("Malformed status: %s", online.status);
+            return "";
+        }
+        path += '/';
+        path += filename;
+        while (!std::isprint(path[path.size() - 1])) {
+            path.resize(path.size() - 1);
+        }
+    }
+
+    return path;
+}
+
 void undupe(const char* username, const char* path)
 {
     const char* filename = strrchr(path, '/');
@@ -176,13 +207,16 @@ void undupe(const char* username, const char* path)
     system(command.str().c_str());
 }
 
-bool slowKickCheck(const ONLINE& online, double& speed)
+bool isUploading(const ONLINE& online)
 {
-    if (online.procid == 0 || strncasecmp(online.status, "STOR ", 5) != 0) {
-        return false;
-    }
+    return online.procid != 0 &&
+           strncasecmp(online.status, "STOR ", 5) == 0 &&
+           kill(online.procid, 0) == 0;
+}
 
-    const Directory* directory = getDirectory(online.currentdir);
+bool slowKickCheck(const ONLINE& online, const std::string& path, double& speed)
+{
+    const Directory* directory = getDirectory(path.c_str());
     if (directory == NULL) {
         return false;
     }
@@ -198,14 +232,14 @@ bool slowKickCheck(const ONLINE& online, double& speed)
         return false;
     }
 
-    if (getNumKicks(online.username, online.currentdir) >= directory->maxKicks) {
+    if (getNumKicks(online.username, path.c_str()) >= directory->maxKicks) {
         return false;
     }
 
     return true;
 }
 
-bool kick(const ONLINE& online, double speed)
+bool kick(const ONLINE& online, const std::string& path, double speed)
 {
     if (kill(online.procid, SIGTERM) < 0) {
         if (errno != ESRCH) {
@@ -214,12 +248,12 @@ bool kick(const ONLINE& online, double speed)
         return false;
     }
 
-    const std::string path = GLFTPD_ROOT + std::string(online.currentdir);
+    const std::string realPath = GLFTPD_ROOT + path;
 
     struct stat st;
-    if (stat(path.c_str(), &st) < 0) {
+    if (stat(realPath.c_str(), &st) < 0) {
         if (errno != ENOENT) {
-            log("Unable to stat file: %s: %s", path.c_str(), strerror(errno));
+            log("Unable to stat path: %s: %s", realPath.c_str(), strerror(errno));
             return false;
         }
 
@@ -228,15 +262,15 @@ bool kick(const ONLINE& online, double speed)
         }
     }
 
-    if (unlink(path.c_str()) < 0) {
-        log("Unable to delete file: %s: %s", path.c_str(), strerror(errno));
+    if (unlink(realPath.c_str()) < 0) {
+        log("Unable to delete file: %s: %s", realPath.c_str(), strerror(errno));
         return false;
     }
 
-    undupe(online.username, online.currentdir);
+    undupe(online.username, path.c_str());
 
-    log("Kicked user for slow uploading: %s: %.0fkB/s: %s", online.username, speed, online.currentdir);
-    gllog(online.username, online.currentdir, speed);
+    log("Kicked user for slow uploading: %s: %.0fkB/s: %s", online.username, speed, path.c_str());
+    gllog(online.username, path.c_str(), speed);
 
     return true;
 }
@@ -283,10 +317,15 @@ void check()
     }
 
     for (std::size_t i = 0; i < numOnline; ++i) {
-        double speed;
-        if (slowKickCheck(online[i], speed)) {
-            if (kick(online[i], speed)) {
-                incrNumKicks(online[i].username, online[i].currentdir);
+        if (isUploading(online[i])) {
+            std::string path = buildPath(online[i]);
+            if (!path.empty()) {
+                double speed;
+                if (slowKickCheck(online[i], path, speed)) {
+                    if (kick(online[i], path, speed)) {
+                        incrNumKicks(online[i].username, path.c_str());
+                    }
+                }
             }
         }
     }
