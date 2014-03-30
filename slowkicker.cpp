@@ -127,7 +127,7 @@ std::string formatTimestamp()
     return timestamp;
 }
 
-void gllog(const char* username, const char* path, double speed)
+void gllog(const char* tag, const char* username, const char* path, double speed)
 {
     std::string logPath = GLFTPD_ROOT + std::string("/ftp-data/logs/glftpd.log");
     FILE* f = std::fopen(logPath.c_str(), "a");
@@ -135,8 +135,8 @@ void gllog(const char* username, const char* path, double speed)
         return;
     }
 
-    std::fprintf(f, "%s SLOWKICK: \"%s\" \"%s\" \"%.0f\"\n",
-                 formatTimestamp().c_str(), path, username, speed);
+    std::fprintf(f, "%s %s: \"%s\" \"%s\" \"%.0f\"\n",
+                 tag, formatTimestamp().c_str(), path, username, speed);
 
     std::fclose(f);
 }
@@ -239,11 +239,11 @@ bool slowKickCheck(const ONLINE& online, const std::string& path, double& speed)
     return true;
 }
 
-bool kick(const ONLINE& online, const std::string& path, double speed)
+bool kick(pid_t procid, const std::string& username, const std::string& path, double speed)
 {
-    if (kill(online.procid, SIGTERM) < 0) {
+    if (kill(procid, SIGTERM) < 0) {
         if (errno != ESRCH) {
-            log("Unable to kill process: %lld: %s", (long long) online.procid, strerror(errno));
+            log("Unable to kill process: %lld: %s", (long long) procid, strerror(errno));
         }
         return false;
     }
@@ -257,7 +257,7 @@ bool kick(const ONLINE& online, const std::string& path, double speed)
             return false;
         }
 
-        if (st.st_uid != online.procid) {
+        if (st.st_uid != procid) {
             return false;
         }
     }
@@ -267,10 +267,13 @@ bool kick(const ONLINE& online, const std::string& path, double speed)
         return false;
     }
 
-    undupe(online.username, path.c_str());
+    undupe(username.c_str(), path.c_str());
 
-    log("Kicked user for slow uploading: %s: %.0fkB/s: %s", online.username, speed, path.c_str());
-    gllog(online.username, path.c_str(), speed);
+    const char* reason = st.st_size == 0 ? "zero byte" : "slow uploading";
+    log("Kicked user for %s: %s: %.0fkB/s: %s", reason, username.c_str(), speed, path.c_str());
+
+    const char* tag = st.st_size == 0 ? "ZEROBYTE" : "SLOWKICK";
+    gllog(tag, username.c_str(), path.c_str(), speed);
 
     return true;
 }
@@ -322,7 +325,7 @@ void check()
             if (!path.empty()) {
                 double speed;
                 if (slowKickCheck(online[i], path, speed)) {
-                    if (kick(online[i], path, speed)) {
+                    if (kick(online[i].procid, online[i].username, path, speed)) {
                         incrNumKicks(online[i].username, path.c_str());
                     }
                 }
