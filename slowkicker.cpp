@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Slowkicker v0.1 Copyright (c) 2014 Biohazard
+// SlowKicker v0.2 Copyright (c) 2014 Biohazard
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -127,7 +127,52 @@ std::string formatTimestamp()
     return timestamp;
 }
 
-void gllog(const char* tag, const char* username, const char* path, double speed)
+std::string lookupGroup(int32_t gid)
+{
+    std::string group = "NoGroup";
+    std::string path = std::string(GLFTPD_ROOT) + "/etc/group";
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f != NULL) {
+        char buf[1024];
+        while (std::fgets(buf, sizeof(buf), f)) {
+            char* p = std::strtok(buf, ":");
+            if (p == NULL) {
+                continue;
+            }
+
+            std::string currentGroup = p;
+            p = std::strtok(NULL, ":");
+            if (p == NULL) {
+                continue;
+            }
+
+            p = std::strtok(NULL, ":");
+            if (p == NULL) {
+                continue;
+            }
+
+            char* pEnd;
+            int32_t currentGid = std::strtol(p, &pEnd, 10);
+            if (*pEnd != '\0' || currentGid != gid) {
+                continue;
+            }
+
+            group = currentGroup;
+            break;
+        }
+        std::fclose(f);
+    }
+    return group;
+}
+
+enum GlftpdLogTag
+{
+    GLTSlow,
+    GLTZeroByte,
+    GLTStalled
+};
+
+void gllog(GlftpdLogTag tag, const char* username, const char* groupname, const char* path, double speed)
 {
     std::string logPath = GLFTPD_ROOT + std::string("/ftp-data/logs/glftpd.log");
     FILE* f = std::fopen(logPath.c_str(), "a");
@@ -135,8 +180,24 @@ void gllog(const char* tag, const char* username, const char* path, double speed
         return;
     }
 
-    std::fprintf(f, "%s %s: \"%s\" \"%s\" \"%.0f\"\n",
-                 tag, formatTimestamp().c_str(), path, username, speed);
+    switch (tag) {
+        case GLTSlow :
+            std::fprintf(f, "%s SLOW: \"%s\" \"%s\" \"%s\" \"%.0f\"\n",
+                         formatTimestamp().c_str(), path, username, groupname, speed);
+            break;
+
+        case GLTZeroByte :
+            std::fprintf(f, "%s ZEROBYTE: \"%s\" \"%s\" \"%s\"\n",
+                         formatTimestamp().c_str(), path, username, groupname);
+
+            break;
+
+        case GLTStalled :
+            std::fprintf(f, "%s STALLED: \"%s\" \"%s\" \"%s\"\n",
+                         formatTimestamp().c_str(), path, username, groupname);
+
+            break;
+    }
 
     std::fclose(f);
 }
@@ -239,7 +300,11 @@ bool slowKickCheck(const ONLINE& online, const std::string& path, double& speed)
     return true;
 }
 
-bool kick(pid_t procid, const std::string& username, const std::string& path, double speed)
+bool kick(pid_t procid,
+          const std::string& username,
+          const std::string& groupname,
+          const std::string& path,
+          double speed)
 {
     if (kill(procid, SIGTERM) < 0) {
         if (errno != ESRCH) {
@@ -269,11 +334,23 @@ bool kick(pid_t procid, const std::string& username, const std::string& path, do
 
     undupe(username.c_str(), path.c_str());
 
-    const char* reason = st.st_size == 0 ? "zero byte" : "slow uploading";
-    log("Kicked user for %s: %s: %.0fkB/s: %s", reason, username.c_str(), speed, path.c_str());
+    const char *reason;
+    GlftpdLogTag tag;
+    if (st.st_size == 0) {
+        reason = "zero byte";
+        tag = GLTZeroByte;
+    }
+    else if (speed == 0) {
+        reason = "stalling upload";
+        tag = GLTStalled;
+    }
+    else {
+        reason = "slow uploading";
+        tag = GLTSlow;
+    }
 
-    const char* tag = st.st_size == 0 ? "ZEROBYTE" : "SLOWKICK";
-    gllog(tag, username.c_str(), path.c_str(), speed);
+    log("Kicked user for %s: %s: %.0fkB/s: %s", reason, username.c_str(), speed, path.c_str());
+    gllog(tag, username.c_str(), groupname.c_str(), path.c_str(), speed);
 
     return true;
 }
@@ -322,13 +399,21 @@ void check()
     for (std::size_t i = 0; i < numOnline; ++i) {
         if (isUploading(online[i])) {
             std::string path = buildPath(online[i]);
-            if (!path.empty()) {
-                double speed;
-                if (slowKickCheck(online[i], path, speed)) {
-                    if (kick(online[i].procid, online[i].username, path, speed)) {
-                        incrNumKicks(online[i].username, path.c_str());
-                    }
-                }
+            if (path.empty()) {
+                continue;
+            }
+
+            double speed;
+            if (!slowKickCheck(online[i], path, speed)) {
+                continue;
+            }
+
+            if (kick(online[i].procid,
+                     online[i].username,
+                     lookupGroup(online[i].groupid).c_str(),
+                     path, speed)) {
+
+                incrNumKicks(online[i].username, path.c_str());
             }
         }
     }
