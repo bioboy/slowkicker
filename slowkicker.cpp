@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// SlowKicker v0.2 Copyright (c) 2014 Biohazard
+// SlowKicker v0.3 Copyright (c) 2014 Biohazard
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -37,6 +37,7 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <fnmatch.h>
 #include "glconf.h"
@@ -55,9 +56,19 @@ const char*       LOCK_FILE     = "/glftpd/tmp/slowkicker.lock";
 const key_t       IPC_KEY       = 0xDEADBABE;
 bool              ONCE_ONLY     = true;
 Directory         DIRECTORIES[] = {
-    { "/site/iso/*",        75,    /* kB/s */    15,    /* seconds */  3 },
-    { "/site/mp3/*",        75,    /* kB/s */    15,    /* seconds */  3 },
-    { "/site/0day/*",       75,    /* kB/s */    15,    /* seconds */  3 }
+    { "/site/iso/*",        125,    /* kB/s */    10,    /* seconds */  3 },
+    { "/site/mp3/*",        125,    /* kB/s */    10,    /* seconds */  3 },
+    { "/site/0day/*",       125,    /* kB/s */    10,    /* seconds */  3 }
+};
+
+struct KickInfo
+{
+    int32_t procid;
+    std::string username;
+    std::string groupname;
+    std::string path;
+    std::string sourceAddress;
+    double speed;
 };
 
 struct History
@@ -70,7 +81,70 @@ struct History
 std::deque<History> history;
 const std::size_t maxHistory = 1000;
 
-History* getHistory(const char* username, const char* path)
+bool lookupSocketInode(int32_t procid, u_int32_t& inode)
+{
+    static const int socketMax = 20;
+
+    bool validInode = false;
+    for (int i = 2; i < socketMax; ++i) {
+        std::ostringstream procPath;
+        procPath << "/proc/" << procid << "/fd/" << i;
+
+        char buf[1024];
+        ssize_t len = readlink(procPath.str().c_str(), buf, sizeof(buf) - 1);
+        if (len < 0) {
+            continue;
+        }
+
+        buf[len] = '\0';
+        if (sscanf(buf, "socket:[%u]", &inode) == 1) {
+            validInode = true;
+        }
+    }
+
+    return validInode;
+}
+
+std::string lookupSourceAddress(int32_t procid)
+{
+    u_int32_t inode;
+    if (!lookupSocketInode(procid, inode)) {
+        return "UNKNOWN";
+    }
+
+    FILE* f = std::fopen("/proc/net/tcp", "r");
+    if (f == NULL) {
+        return "UNKNOWN";
+    }
+
+    char buf[1024];
+    std::string sourceAddress = "UNKNOWN";
+    while (std::fgets(buf, sizeof(buf), f)) {
+        u_int32_t currentInode;
+        u_int32_t remoteAddr;
+        int n = std::sscanf(buf, "%*d: %*8x:%*4x %8x:%*4x %*2x %*8x:%*8x %*2x: %*8x%*8x %*d %*d %u",
+                            &remoteAddr, &currentInode);
+        if (n == EOF) {
+            break;
+        }
+
+        if (n != 2 || currentInode != inode) {
+            continue;
+        }
+
+        char remoteIP[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &remoteAddr, remoteIP, sizeof(remoteIP))) {
+            sourceAddress = remoteIP;
+        }
+
+        break;
+    }
+
+    std::fclose(f);
+    return sourceAddress;
+}
+
+History* getHistory(const std::string& username, const std::string& path)
 {
     for (std::size_t i = 0; i < history.size(); ++i) {
         if (history[i].username == username && history[i].path == path) {
@@ -81,7 +155,7 @@ History* getHistory(const char* username, const char* path)
     return NULL;
 }
 
-int getNumKicks(const char* username, const char* path)
+int getNumKicks(const std::string& username, const std::string& path)
 {
     History* entry = getHistory(username, path);
     if (entry == NULL) {
@@ -91,7 +165,7 @@ int getNumKicks(const char* username, const char* path)
     return entry->numKicks;
 }
 
-void incrNumKicks(const char* username, const char* path)
+void incrNumKicks(const std::string& username, const std::string& path)
 {
     History* entry = getHistory(username, path);
     if (entry == NULL) {
@@ -106,12 +180,12 @@ void incrNumKicks(const char* username, const char* path)
     ++entry->numKicks;
 }
 
-const Directory* getDirectory(const char* path)
+const Directory* getDirectory(const std::string& path)
 {
     static const std::size_t numDirectories = sizeof(DIRECTORIES) / sizeof(Directory);
 
     for (std::size_t i = 0; i < numDirectories; ++i) {
-        if (!fnmatch(DIRECTORIES[i].mask, path, 0)) {
+        if (!fnmatch(DIRECTORIES[i].mask, path.c_str(), 0)) {
             return &DIRECTORIES[i];
         }
     }
@@ -172,7 +246,7 @@ enum GlftpdLogTag
     GLTStalled
 };
 
-void gllog(GlftpdLogTag tag, const char* username, const char* groupname, const char* path, double speed)
+void gllog(GlftpdLogTag tag, const KickInfo& info)
 {
     std::string logPath = GLFTPD_ROOT + std::string("/ftp-data/logs/glftpd.log");
     FILE* f = std::fopen(logPath.c_str(), "a");
@@ -182,20 +256,31 @@ void gllog(GlftpdLogTag tag, const char* username, const char* groupname, const 
 
     switch (tag) {
         case GLTSlow :
-            std::fprintf(f, "%s SLOW: \"%s\" \"%s\" \"%s\" \"%.0f\"\n",
-                         formatTimestamp().c_str(), path, username, groupname, speed);
+            std::fprintf(f, "%s SLOW: \"%s\" \"%s\" \"%s\" \"%s\" \"%.0f\"\n",
+                         formatTimestamp().c_str(),
+                         info.path.c_str(),
+                         info.username.c_str(),
+                         info.groupname.c_str(),
+                         info.sourceAddress.c_str(),
+                         info.speed);
             break;
 
         case GLTZeroByte :
-            std::fprintf(f, "%s ZEROBYTE: \"%s\" \"%s\" \"%s\"\n",
-                         formatTimestamp().c_str(), path, username, groupname);
-
+            std::fprintf(f, "%s ZEROBYTE: \"%s\" \"%s\" \"%s\" \"%s\"\n",
+                         formatTimestamp().c_str(),
+                         info.path.c_str(),
+                         info.username.c_str(),
+                         info.groupname.c_str(),
+                         info.sourceAddress.c_str());
             break;
 
         case GLTStalled :
-            std::fprintf(f, "%s STALLED: \"%s\" \"%s\" \"%s\"\n",
-                         formatTimestamp().c_str(), path, username, groupname);
-
+            std::fprintf(f, "%s STALLED: \"%s\" \"%s\" \"%s\" \"%s\"\n",
+                         formatTimestamp().c_str(),
+                         info.path.c_str(),
+                         info.username.c_str(),
+                         info.groupname.c_str(),
+                         info.sourceAddress.c_str());
             break;
     }
 
@@ -250,11 +335,11 @@ std::string buildPath(const ONLINE& online)
     return path;
 }
 
-void undupe(const char* username, const char* path)
+void undupe(const std::string& username, const std::string& path)
 {
-    const char* filename = strrchr(path, '/');
+    const char* filename = strrchr(path.c_str(), '/');
     if (filename == NULL) {
-        log("Undupe failed, malformed path: %s: %s", username, path);
+        log("Undupe failed, malformed path: %s: %s", username.c_str(), path.c_str());
         return;
     }
     ++filename;
@@ -268,16 +353,22 @@ void undupe(const char* username, const char* path)
     system(command.str().c_str());
 }
 
-bool isUploading(const ONLINE& online)
+bool needsKicking(const ONLINE& online, KickInfo& info)
 {
-    return online.procid != 0 &&
-           strncasecmp(online.status, "STOR ", 5) == 0 &&
-           kill(online.procid, 0) == 0;
-}
+    if (online.procid == 0 ||
+        strncasecmp(online.status, "STOR ", 5) != 0 ||
+        kill(online.procid, 0) < 0) {
 
-bool slowKickCheck(const ONLINE& online, const std::string& path, double& speed)
-{
-    const Directory* directory = getDirectory(path.c_str());
+        return false;
+    }
+
+    info.username = online.username;
+    info.path = buildPath(online);
+    if (info.path.empty()) {
+        return false;
+    }
+
+    const Directory* directory = getDirectory(info.path);
     if (directory == NULL) {
         return false;
     }
@@ -287,42 +378,43 @@ bool slowKickCheck(const ONLINE& online, const std::string& path, double& speed)
 
     double duration = (now.tv_sec - online.tstart.tv_sec) +
                       ((now.tv_usec - online.tstart.tv_usec) / 1000000.0);
-    speed = (duration == 0 ? online.bytes_xfer
-                           : online.bytes_xfer / duration) / 1024.0;
-    if (duration < directory->minDuration || speed >= directory->minSpeed) {
+    info.speed = (duration == 0 ? online.bytes_xfer
+                                : online.bytes_xfer / duration) / 1024.0;
+    if (duration < directory->minDuration || info.speed >= directory->minSpeed) {
         return false;
     }
 
-    if (getNumKicks(online.username, path.c_str()) >= directory->maxKicks) {
+    if (getNumKicks(info.username, info.path) >= directory->maxKicks) {
         return false;
     }
+
+    const std::string realPath = GLFTPD_ROOT + info.path;
+    if (access(realPath.c_str(), X_OK) != 0) {
+        return false;
+    }
+
+    info.groupname = lookupGroup(online.groupid);
+    info.procid = online.procid;
+    info.sourceAddress = lookupSourceAddress(online.procid);
 
     return true;
 }
 
-bool kick(pid_t procid,
-          const std::string& username,
-          const std::string& groupname,
-          const std::string& path,
-          double speed)
+bool kick(const KickInfo& info)
 {
-    if (kill(procid, SIGTERM) < 0) {
+    if (kill(info.procid, SIGTERM) < 0) {
         if (errno != ESRCH) {
-            log("Unable to kill process: %lld: %s", (long long) procid, strerror(errno));
+            log("Unable to kill process: %lld: %s", (long long) info.procid, strerror(errno));
         }
         return false;
     }
 
-    const std::string realPath = GLFTPD_ROOT + path;
+    const std::string realPath = GLFTPD_ROOT + info.path;
 
     struct stat st;
     if (stat(realPath.c_str(), &st) < 0) {
         if (errno != ENOENT) {
             log("Unable to stat path: %s: %s", realPath.c_str(), strerror(errno));
-            return false;
-        }
-
-        if (st.st_uid != procid) {
             return false;
         }
     }
@@ -332,7 +424,7 @@ bool kick(pid_t procid,
         return false;
     }
 
-    undupe(username.c_str(), path.c_str());
+    undupe(info.username, info.path);
 
     const char *reason;
     GlftpdLogTag tag;
@@ -340,7 +432,7 @@ bool kick(pid_t procid,
         reason = "zero byte";
         tag = GLTZeroByte;
     }
-    else if (speed == 0) {
+    else if (info.speed == 0) {
         reason = "stalling upload";
         tag = GLTStalled;
     }
@@ -349,8 +441,10 @@ bool kick(pid_t procid,
         tag = GLTSlow;
     }
 
-    log("Kicked user for %s: %s: %.0fkB/s: %s", reason, username.c_str(), speed, path.c_str());
-    gllog(tag, username.c_str(), groupname.c_str(), path.c_str(), speed);
+    log("Kicked user for %s: %s: %s: %.0fkB/s: %s",
+        reason, info.username.c_str(), info.sourceAddress.c_str(),
+        info.speed, info.path.c_str());
+    gllog(tag, info);
 
     return true;
 }
@@ -397,24 +491,13 @@ void check()
     }
 
     for (std::size_t i = 0; i < numOnline; ++i) {
-        if (isUploading(online[i])) {
-            std::string path = buildPath(online[i]);
-            if (path.empty()) {
-                continue;
-            }
+        KickInfo info;
+        if (!needsKicking(online[i], info)) {
+            continue;
+        }
 
-            double speed;
-            if (!slowKickCheck(online[i], path, speed)) {
-                continue;
-            }
-
-            if (kick(online[i].procid,
-                     online[i].username,
-                     lookupGroup(online[i].groupid).c_str(),
-                     path, speed)) {
-
-                incrNumKicks(online[i].username, path.c_str());
-            }
+        if (kick(info)) {
+            incrNumKicks(info.username, info.path);
         }
     }
 
