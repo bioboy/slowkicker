@@ -350,7 +350,9 @@ void undupe(const std::string& username, const std::string& path)
             << " -f '" << filename << "'"
             << " >/dev/null 2>/dev/null";
 
-    system(command.str().c_str());
+    if (system(command.str().c_str()) < 0) {
+        log("Undupe failed: %s: %s: %s", username.c_str(), path.c_str(), strerror(errno));
+    }
 }
 
 bool needsKicking(const ONLINE& online, KickInfo& info)
@@ -404,7 +406,7 @@ bool kick(const KickInfo& info)
 {
     if (kill(info.procid, SIGTERM) < 0) {
         if (errno != ESRCH) {
-            log("Unable to kill process: %lld: %s", (long long) info.procid, strerror(errno));
+            log("Unable to kill process: %ld: %s", (long) info.procid, strerror(errno));
         }
         return false;
     }
@@ -456,7 +458,7 @@ void detach_online(ONLINE* online)
 
 ONLINE* open_online(std::size_t& num)
 {
-    long long shmid = shmget(IPC_KEY, 0, 0);
+    int shmid = shmget(IPC_KEY, 0, 0);
     if (shmid < 0) {
         if (errno == ENOENT) {
             return NULL;
