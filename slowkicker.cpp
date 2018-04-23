@@ -53,7 +53,7 @@ struct Directory
 const char*       GLFTPD_ROOT   = "/glftpd";
 const char*       LOG_FILE      = "/glftpd/ftp-data/logs/slowkicker.log";
 const char*       LOCK_FILE     = "/glftpd/tmp/slowkicker.lock";
-const key_t       IPC_KEY       = 0xDEADBABE;
+const key_t       IPC_KEY       = 0x0000DEAD;
 bool              ONCE_ONLY     = true;
 Directory         DIRECTORIES[] = {
     { "/site/iso/*",        125,    /* kB/s */    10,    /* seconds */  3 },
