@@ -321,7 +321,7 @@ std::string buildPath(const ONLINE& online)
     std::string path(online.currentdir);
     if (S_ISDIR(st.st_mode)) {
         const char* filename = online.status + 5;
-        if (filename == '\0') {
+        if (*filename == '\0') {
             log("Malformed status: %s", online.status);
             return "";
         }
